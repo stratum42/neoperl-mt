@@ -1,0 +1,337 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use FindBin ();
+use File::Spec ();
+use Cwd qw(abs_path getcwd);
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my $ROOT;
+
+BEGIN {
+    $ROOT = abs_path(File::Spec->catdir($FindBin::RealBin, File::Spec->updir));
+    for my $rel (
+        File::Spec->catdir('blib', 'arch'),
+        File::Spec->catdir('blib', 'lib'),
+        'lib',
+    ) {
+        my $dir = File::Spec->catdir($ROOT, $rel);
+        unshift @INC, $dir if -d $dir;
+    }
+
+    # Add optional sibling MT repositories and $HOME/perl5 to @INC when present
+    my $parent = File::Spec->catdir($ROOT, File::Spec->updir);
+    my %have = map { $_ => 1 } grep { !ref($_) } @INC;
+    my $prepend = sub {
+        my ($d) = @_;
+        return unless defined $d && -d $d;
+        my $abs = eval { abs_path($d) } || $d;
+        return if $have{$abs};
+        unshift @INC, $abs;
+        $have{$abs} = 1;
+    };
+
+    my $home = $ENV{HOME} || $ENV{USERPROFILE} || '';
+    $prepend->(File::Spec->catdir($home, 'perl5', 'lib', 'perl5')) if length $home;
+
+    for my $spec (
+        [ $ENV{NEOPERL_DBD_SQLITE_DIR}, 'dbd-sqlite-mt', [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBD_ODBC_DIR},   'dbd-odbc-mt',   [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBI_DIR},        'dbi-mt',        [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_MOJO_DIR},       'mojolicious-mt',[ 'xs/blib/arch', 'xs/blib/lib', 'lib' ] ],
+        [ $ENV{TCL_TK_MT_DIR} || $ENV{NEOPERL_TK_DIR}, 'tcl-tk-mt', [ 'blib/arch', 'blib/lib', 'lib' ] ],
+    ) {
+        my ($env_dir, $repo, $subs) = @$spec;
+        my $base = (defined $env_dir && length $env_dir && -d $env_dir)
+            ? $env_dir
+            : File::Spec->catdir($parent, $repo);
+        next unless -d $base;
+        for my $rel (reverse @$subs) {
+            $prepend->(File::Spec->catdir($base, split('/', $rel)));
+        }
+    }
+}
+
+my $use_tui      = 0;
+my $use_gpu      = 0;
+my $headless     = 0;
+my $demo         = 0;
+my $demo_scene;
+my $demo_tab;
+my $demo_float;
+my $demo_explorer;
+my $agy_opt;
+my $agy_bin;
+my $agy_model;
+my $agy_sandbox  = 0;
+my $agy_login    = 0;
+my $agy_mock     = 0;
+my $nvim_engine  = 0;
+my $nvim_bin;
+my $db2_dsn;
+my $listen;
+my @mcp_pack_args;
+my $inference_mock = 0;
+my $model_dir;
+my $ram_budget;
+my $backend      = 'auto';
+my $theme;
+my $screenshot;
+my $scale;
+my $auto_exit_ms = 0;
+my $width;
+my $height;
+my $cwd;
+my $show_info    = 0;
+my $show_help    = 0;
+my $show_version = 0;
+
+GetOptions(
+    'tui!'            => \$use_tui,
+    'gpu!'            => \$use_gpu,
+    'headless!'       => \$headless,
+    'demo!'           => \$demo,
+    'demo-scene=s'    => \$demo_scene,
+    'demo-tab=s'      => \$demo_tab,
+    'demo-float=s'    => \$demo_float,
+    'demo-explorer!'  => \$demo_explorer,
+    'agy!'            => \$agy_opt,
+    'agy-bin=s'       => \$agy_bin,
+    'agy-model=s'     => \$agy_model,
+    'agy-sandbox!'    => \$agy_sandbox,
+    'agy-login!'      => \$agy_login,
+    'agy-mock!'       => \$agy_mock,
+    'nvim-engine!'    => \$nvim_engine,
+    'nvim-bin=s'      => \$nvim_bin,
+    'db2-dsn=s'        => \$db2_dsn,
+    'listen=s'         => \$listen,
+    'mcp-pack=s@'      => \@mcp_pack_args,
+    'inference-mock!'  => \$inference_mock,
+    'model-dir=s'      => \$model_dir,
+    'ram-budget=f'     => \$ram_budget,
+    'backend=s'        => \$backend,
+    'theme=s'         => \$theme,
+    'screenshot=s'    => \$screenshot,
+    'scale=f'         => \$scale,
+    'auto-exit-ms=i'  => \$auto_exit_ms,
+    'width=i'         => \$width,
+    'height=i'        => \$height,
+    'cwd=s'           => \$cwd,
+    'info!'           => \$show_info,
+    'version|V'       => \$show_version,
+    'help|h'          => \$show_help,
+) or die "Run 'npl --help' for usage.\n";
+
+if ($show_help) {
+    print <<'USAGE';
+Usage: npl [options] [files_or_dir...]
+
+Frontends:
+  --gpu                          Force Retina Tcl::Tk::MT::Canvas GPU GUI
+  --tui                          Force 24-bit ANSI terminal TUI
+  --headless                     Run without opening an interactive display/TTY
+  --backend=auto|metal|vulkan|software
+                                 Select GPU canvas backend (default: auto)
+  --scale=1|2                    Retina backing scale factor (default: 2 for --screenshot)
+  --theme=aix_amber|tokyonight|catppuccin|gruvbox|kanagawa
+                                 Color theme (default: aix_amber)
+  --width=N / --height=N         Window or offscreen viewport dimensions
+
+Integrations:
+  --agy                          Force live signed-in agy ACP auto-connect (default when agy is found)
+  --no-agy                       Disable automatic Antigravity ACP startup (AGY:OFF)
+  --agy-bin=PATH                 Custom path to agy CLI binary
+  --agy-model=MODEL              Preferred Antigravity model ID to select on connect
+  --agy-sandbox                  Pass --sandbox to agy acp for sandboxed terminal execution
+  --agy-login                    Run interactive 'agy acp --login' sign-in (exits if no files/UI flags given)
+  --agy-mock                     Start built-in ACP loopback server for offline demo/CI
+  --nvim-engine                  Embed upstream Neovim (nvim --embed) over Msgpack-RPC
+  --nvim-bin=PATH                Custom path to nvim binary for --nvim-engine
+  --db2-dsn=DSN                  IBM Db2 DBI/ODBC DSN for semantic memory store
+  --listen=ADDR                  Start JSON-RPC 2.0 server (unix path, host:port, http://...)
+  --mcp-pack=NAME[,NAME2]|all    Mount domain MCP pack(s) into EditorMCP on startup
+
+Local Inference:
+  --inference-mock               Force deterministic offline loopback for all 4 local inference roles
+  --model-dir=PATH               Directory containing local GGUF weights (default: ~/.cache/neoperl/models)
+  --ram-budget=GB                Local RAM residency budget in GB for managed models (default: 20)
+
+Demo & Inspection:
+  --demo                         Populate demo splits, diagnostics, diff hunks & tabs
+  --demo-scene=chat_diff|aix_nvim_embed|aix_mainframe_db|aix_gpu_asm|memory|models|memory_bonsai|xs_cachegrind
+                                 Select demo scenario (default: chat_diff; aix_nvim_embed with --nvim-engine)
+  --demo-tab=chat|memory|models|xsdev|none
+                                 Override Command Center tab in demo mode
+  --demo-float=none|telescope|inline|whichkey
+                                 Override floating window in demo mode
+  --demo-explorer                Open left File Explorer in demo mode
+  --screenshot=PATH.png          Render GPU frame and export RGBA PNG screenshot (2x Retina default)
+  --auto-exit-ms=N               Exit automatically after N milliseconds
+  --info                         Print detected architecture, backends & capabilities
+  -V, --version                  Show version and exit
+  -h, --help                     Show this help message
+USAGE
+    exit 0;
+}
+
+$backend = lc($backend // 'auto');
+die "Invalid --backend '$backend' (expected auto|metal|vulkan|software)\n"
+    unless $backend =~ /\A(?:auto|metal|vulkan|software)\z/;
+$ENV{TCL_TK_MT_BACKEND} = $backend if $backend ne 'auto';
+
+require NeoPerl::MT;
+
+if ($show_version) {
+    print "NeoPerl::MT $NeoPerl::MT::VERSION\n";
+    exit 0;
+}
+
+if ($agy_login) {
+    require NeoPerl::Antigravity::ACP;
+    my $bin = $agy_bin || NeoPerl::Antigravity::ACP::discover_agy_binary();
+    if (!defined $bin) {
+        print STDERR NeoPerl::Antigravity::ACP::install_instructions() . "\n";
+        exit 1;
+    }
+    my $rc = system($bin, 'acp', '--login');
+    if ($rc != 0) {
+        exit(($rc >> 8) || 1);
+    }
+    if (!@ARGV && !$demo && !$use_tui && !$use_gpu && !$show_info && !defined($screenshot)) {
+        print "Antigravity CLI signed in via $bin acp --login.\n";
+        exit 0;
+    }
+}
+
+my @files;
+for my $arg (@ARGV) {
+    if (-d $arg) {
+        $cwd //= $arg;
+    }
+    else {
+        push @files, $arg;
+    }
+}
+$cwd //= getcwd();
+
+my $ui_mode = $use_tui    ? 'tui'
+            : $use_gpu    ? 'gpu'
+            : $screenshot ? 'gpu'
+            : 'auto';
+
+my @mcp_packs = map { grep { length } split /,/, $_ } @mcp_pack_args;
+
+# Default headless --screenshot captures to 2.0x Retina HiDPI unless --scale was specified
+my $eff_scale = defined($scale) ? $scale : (defined($screenshot) && length($screenshot) ? 2.0 : undef);
+$demo_scene //= $nvim_engine ? 'aix_nvim_embed' : 'chat_diff';
+
+my $app = NeoPerl::MT->new(
+    cwd          => $cwd,
+    ui           => $ui_mode,
+    backend      => $backend,
+    (defined $eff_scale ? (scale => $eff_scale) : ()),
+    (defined $theme ? (theme => $theme) : ()),
+    (@mcp_packs ? (mcp_packs => \@mcp_packs) : ()),
+    headless     => ($headless || defined($screenshot)) ? 1 : 0,
+    width        => $width,
+    height       => $height,
+    auto_exit_ms => $auto_exit_ms,
+    agy_mock     => $agy_mock,
+    (defined $agy_opt     ? (agy       => $agy_opt ? 1 : 0) : ()),
+    (defined $agy_opt && !$agy_opt ? (no_agy => 1) : ()),
+    (defined $agy_bin     ? (agy_bin   => $agy_bin)         : ()),
+    (defined $agy_model   ? (agy_model => $agy_model)       : ()),
+    ($agy_sandbox         ? (agy_sandbox => 1)              : ()),
+    nvim_engine    => $nvim_engine,
+    nvim_bin       => $nvim_bin,
+    db2_dsn        => $db2_dsn,
+    listen         => $listen,
+    demo           => $demo ? 1 : 0,
+    ($inference_mock     ? (inference_mock => 1)           : ()),
+    (defined $model_dir  ? (model_dir      => $model_dir)  : ()),
+    (defined $ram_budget ? (ram_budget_gb  => $ram_budget) : ()),
+    load_config    => $demo ? 0 : 1,
+);
+
+if ($show_info) {
+    my $tel = $app->telemetry();
+    my $arch = $tel->{arch} || {};
+    printf "NeoPerl::MT %s (Perl %s, perl5-mt=%d)\n", $tel->{version}, $tel->{perl_version}, $tel->{is_perl5_mt};
+    printf "  Arch:        %s (page=%dB, cores=%d phys/%d log, simd=%s, power=%s)\n",
+        $arch->{arch} // 'unknown', $arch->{page_size} // 4096,
+        $arch->{physical_cores} // 1, $arch->{logical_cpus} // 1,
+        $arch->{simd_level} // 'scalar', $arch->{power_isa} // 'none';
+    printf "  UI:          %s (%s)\n", $tel->{ui_mode}, $tel->{ui_backend};
+    printf "  Nvim Engine: %s\n",
+        $tel->{nvim_engine}{active}
+            ? sprintf('enabled (%s%s)', $tel->{nvim_engine}{version} || 'nvim', $tel->{nvim_engine}{mock} ? ', mock' : '')
+            : 'native C11 VimEngine';
+    printf "  Memory:      %s\n", $tel->{memory_dialect};
+    if (ref($tel->{acp}) eq 'HASH') {
+        printf "  Antigravity: %s (state=%s, bin=%s%s)\n",
+            $tel->{acp}{pill} // 'AGY:OFF',
+            $tel->{acp}{state} // 'offline',
+            $tel->{acp}{binary} // '<not found>',
+            ($tel->{acp}{current_model} ? ", model=$tel->{acp}{current_model}" : '');
+    }
+    if (ref($tel->{inference}) eq 'HASH' && ref($tel->{inference}{slots}) eq 'ARRAY') {
+        my $inf = $tel->{inference};
+        my $lb  = ref($inf->{llama_bridge}) eq 'HASH' ? $inf->{llama_bridge} : {};
+        my $acc = $inf->{accelerator} // ($app->inference ? $app->inference->config->accelerator : 'none');
+        my $skp = $inf->{local_ai_skipped_reason} // ($app->inference ? $app->inference->config->local_ai_skipped_reason : '');
+        printf "  Inference:   ram_budget=%.1f GB, accelerator=%s, libllama=%s%s\n",
+            ($inf->{ram_budget_gb} // 20.0),
+            $acc,
+            ($lb->{available} ? 'available' : 'unavailable'),
+            ($lb->{available} && length($lb->{library_path} // '')) ? " ($lb->{library_path})" : '';
+        if (length $skp) {
+            printf "  Local AI:    skipped (%s)\n", $skp;
+        }
+        for my $s (@{ $inf->{slots} }) {
+            printf "    %-14s %-16s fork=%-8s (%s)\n",
+                $s->{role}, $s->{transport}, $s->{backend_fork} // 'upstream', $s->{model_id} // '';
+        }
+    }
+    printf "  Mojo Accel:  %s (simd=%s)\n",
+        $tel->{mojo_accel}{available} ? 'enabled' : 'unavailable',
+        $tel->{mojo_accel}{simd_tier} // 'none';
+    printf "  Editor MCP:  %s (%d tools, engine=%s)\n",
+        $tel->{mcp}{running} ? ($tel->{mcp}{url} // 'running') : 'stopped',
+        $tel->{mcp}{tool_count} // 0,
+        $tel->{mcp}{engine} // 'none';
+    printf "  MCP Packs:   %d available (%d active, %d domain tools)\n",
+        $tel->{mcp_packs}{total_packs}  // 0,
+        $tel->{mcp_packs}{active_count} // 0,
+        $tel->{mcp_packs}{total_tools}  // 0;
+    $app->shutdown();
+    exit 0;
+}
+
+if ($demo) {
+    $app->setup_demo(
+        scene    => $demo_scene,
+        (defined $demo_tab      ? (tab      => $demo_tab)      : ()),
+        (defined $demo_float    ? (float    => $demo_float)    : ()),
+        (defined $demo_explorer ? (explorer => $demo_explorer) : ()),
+    );
+}
+elsif (@files) {
+    $app->open_files(@files);
+}
+
+if (defined $screenshot && length $screenshot) {
+    my $res = $app->export_screenshot($screenshot);
+    $app->shutdown();
+    exit($res && $res->{ok} ? 0 : 1);
+}
+
+if ($headless && $auto_exit_ms <= 0) {
+    $app->ui->render_frame() if $app->ui && $app->ui->can('render_frame');
+    $app->shutdown();
+    exit 0;
+}
+
+$app->run();
+$app->shutdown();
+exit 0;

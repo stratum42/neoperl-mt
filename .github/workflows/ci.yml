@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  macos-arm64:
+    name: macOS (arm64 / NEON)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Strict C11 compile check (-std=c11 -O3 -Wall -Wextra -Werror)
+        run: |
+          for f in c/buffer.c c/diff.c c/syntax.c c/treesitter_bridge.c \
+                   c/fuzzy.c c/pty_term.c c/vec_simd.c c/llama_bridge.c \
+                   c/vim_engine.c c/msgpack.c; do
+            cc -std=c11 -O3 -Wall -Wextra -Werror -I. -Ic -c "$f" -o /tmp/check.o
+          done
+          rm -f /tmp/check.o
+
+      - name: Configure & Build
+        run: |
+          perl Makefile.PL
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Run Test Suite & Scalar Parity
+        run: |
+          NEOPERL_INFERENCE_MOCK=1 prove -b t/
+          PERL_FORCE_SCALAR=1 prove -b -v t/01_core_buffer.t t/02_diff_syntax_ts.t t/03_fuzzy_pty_simd.t
+
+  linux-x86_64:
+    name: Linux (Ubuntu x86_64 / GCC -Werror)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential perl
+
+      - name: Strict GCC C11 compile check (-std=c11 -O3 -Wall -Wextra -Werror)
+        run: |
+          for f in c/buffer.c c/diff.c c/syntax.c c/treesitter_bridge.c \
+                   c/fuzzy.c c/pty_term.c c/vec_simd.c c/llama_bridge.c \
+                   c/vim_engine.c c/msgpack.c; do
+            gcc -std=c11 -O3 -Wall -Wextra -Werror -I. -Ic -c "$f" -o /tmp/check.o
+          done
+          rm -f /tmp/check.o
+
+      - name: Configure & Build
+        run: |
+          perl Makefile.PL
+          make -j$(nproc)
+
+      - name: Run Test Suite & Scalar Parity
+        run: |
+          NEOPERL_INFERENCE_MOCK=1 prove -b t/
+          PERL_FORCE_SCALAR=1 prove -b -v t/01_core_buffer.t t/02_diff_syntax_ts.t t/03_fuzzy_pty_simd.t
+
+  linux-ppc64le:
+    name: Linux (ppc64le / IBM POWER8+ VSX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install POWER8+ ppc64le cross-compiler and QEMU user emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross qemu-user
+
+      - name: Strict POWER8+ VSX C11 compile check (-mcpu=power8 -mvsx -Werror)
+        run: |
+          for f in c/buffer.c c/diff.c c/syntax.c c/treesitter_bridge.c \
+                   c/fuzzy.c c/pty_term.c c/vec_simd.c c/llama_bridge.c \
+                   c/vim_engine.c c/msgpack.c; do
+            powerpc64le-linux-gnu-gcc -mcpu=power8 -mvsx -std=c11 -O3 \
+              -Wall -Wextra -Werror -I. -Ic -c "$f" -o /tmp/check_ppc64le.o
+          done
+          rm -f /tmp/check_ppc64le.o
+
+  windows-ucrt64:
+    name: Windows (Win64 / MSYS2 UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (UCRT64 + GCC + Perl)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-make
+            mingw-w64-ucrt-x86_64-perl
+
+      - name: Strict C11 compile check (-std=c11 -O3 -Wall -Wextra -Werror)
+        run: |
+          for f in c/buffer.c c/diff.c c/syntax.c c/treesitter_bridge.c \
+                   c/fuzzy.c c/pty_term.c c/vec_simd.c c/llama_bridge.c \
+                   c/vim_engine.c c/msgpack.c; do
+            gcc -std=c11 -O3 -Wall -Wextra -Werror -I. -Ic -c "$f" -o check.o
+          done
+          rm -f check.o
+
+      - name: Configure & Build
+        run: |
+          perl Makefile.PL
+          mingw32-make -j$(nproc)
+
+      - name: Run Core & Parity Tests
+        run: |
+          prove -b -v t/01_core_buffer.t t/02_diff_syntax_ts.t t/03_fuzzy_pty_simd.t
+          PERL_FORCE_SCALAR=1 prove -b -v t/01_core_buffer.t t/02_diff_syntax_ts.t t/03_fuzzy_pty_simd.t

@@ -1,0 +1,20 @@
+NeoPerl::MT is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself, either:
+
+  a) the GNU General Public License as published by the Free Software
+     Foundation; either version 1, or (at your option) any later version, or
+
+  b) the "Artistic License" which comes with Perl.
+
+See `perldoc perlartistic` and `perldoc perlgpl` for the full text of both
+licenses.
+
+AUTHOR
+
+stratum42
+
+ACKNOWLEDGMENTS
+
+NeoPerl::MT builds on the editing traditions of Vim and Neovim, the Perl 5
+language and community, Tcl/Tk, Mojolicious, DBI, IBM Plex, Tree-sitter,
+llama.cpp, and the open-source developer tooling ecosystem.

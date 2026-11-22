@@ -1,0 +1,305 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use FindBin ();
+use File::Spec ();
+use Cwd qw(abs_path);
+use Getopt::Long qw(:config no_ignore_case bundling);
+use IO::Handle ();
+use JSON::PP ();
+
+my $ROOT;
+
+BEGIN {
+    $ROOT = abs_path(File::Spec->catdir($FindBin::RealBin, File::Spec->updir));
+    for my $rel (
+        File::Spec->catdir('blib', 'arch'),
+        File::Spec->catdir('blib', 'lib'),
+        'lib',
+    ) {
+        my $dir = File::Spec->catdir($ROOT, $rel);
+        unshift @INC, $dir if -d $dir;
+    }
+
+    # Add optional sibling MT repositories and $HOME/perl5 to @INC when present
+    my $parent = File::Spec->catdir($ROOT, File::Spec->updir);
+    my %have = map { $_ => 1 } grep { !ref($_) } @INC;
+    my $prepend = sub {
+        my ($d) = @_;
+        return unless defined $d && -d $d;
+        my $abs = eval { abs_path($d) } || $d;
+        return if $have{$abs};
+        unshift @INC, $abs;
+        $have{$abs} = 1;
+    };
+
+    my $home = $ENV{HOME} || $ENV{USERPROFILE} || '';
+    $prepend->(File::Spec->catdir($home, 'perl5', 'lib', 'perl5')) if length $home;
+
+    for my $spec (
+        [ $ENV{NEOPERL_DBD_SQLITE_DIR}, 'dbd-sqlite-mt',  [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBD_ODBC_DIR},   'dbd-odbc-mt',    [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBI_DIR},        'dbi-mt',         [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_MOJO_DIR},       'mojolicious-mt', [ 'xs/blib/arch', 'xs/blib/lib', 'lib' ] ],
+        [ $ENV{TCL_TK_MT_DIR} || $ENV{NEOPERL_TK_DIR}, 'tcl-tk-mt', [ 'blib/arch', 'blib/lib', 'lib' ] ],
+    ) {
+        my ($env_dir, $repo, $subs) = @$spec;
+        my $base = (defined $env_dir && length $env_dir && -d $env_dir)
+            ? $env_dir
+            : File::Spec->catdir($parent, $repo);
+        next unless -d $base;
+        for my $rel (reverse @$subs) {
+            $prepend->(File::Spec->catdir($base, split('/', $rel)));
+        }
+    }
+}
+
+use NeoPerl::MCP::Registry;
+use NeoPerl::Antigravity::EditorMCP;
+
+our $VERSION = '0.01';
+
+my @pack_args;
+my $list_packs      = 0;
+my $use_stdio       = 0;
+my $http_addr;
+my $fallback_http   = 0;
+my $emit_config     = 0;
+my $output_path;
+my $as_json         = 0;
+my $dsn;
+my $user;
+my $pass;
+my $allow_write     = 0;
+my $show_help       = 0;
+my $show_version    = 0;
+
+GetOptions(
+    'pack=s@'          => \@pack_args,
+    'list-packs!'      => \$list_packs,
+    'stdio!'           => \$use_stdio,
+    'http=s'           => \$http_addr,
+    'fallback-http!'   => \$fallback_http,
+    'emit-mcp-config!' => \$emit_config,
+    'output|o=s'       => \$output_path,
+    'json!'            => \$as_json,
+    'dsn=s'            => \$dsn,
+    'user=s'           => \$user,
+    'pass=s'           => \$pass,
+    'allow-write!'     => \$allow_write,
+    'version|V'        => \$show_version,
+    'help|h'           => \$show_help,
+) or die "Run 'npl-mcp --help' for usage.\n";
+
+if ($show_help) {
+    print <<'USAGE';
+Usage: npl-mcp [options]
+
+Standalone NeoPerl::MT MCP domain pack server (stdio NDJSON or Mojolicious HTTP).
+
+Options:
+  --list-packs                   List all 12 domain MCP packs and tool counts
+  --pack=<name[,name2]|all>      Select one or more packs (repeatable; default: all)
+  --stdio                        Serve JSON-RPC 2.0 NDJSON over STDIN/STDOUT
+  --http=<[host:]port>           Serve Streamable HTTP/JSON-RPC 2.0 (Mojolicious + fallback)
+  --fallback-http                Force pure-Perl IO::Socket::INET HTTP server
+  --emit-mcp-config              Print ready-to-use .agents/mcp_config.json JSON
+  -o, --output=PATH              Write --emit-mcp-config output to PATH
+  --json                         Format --list-packs output as JSON
+  --dsn=DSN                      Optional DBI/ODBC DSN forwarded to DB packs
+  --user=USER / --pass=PASS      Optional DB credentials
+  --allow-write                  Permit mutating SQL statements in DB packs
+  -V, --version                  Print version and exit
+  -h, --help                     Show this help message
+USAGE
+    exit 0;
+}
+
+if ($show_version) {
+    print "npl-mcp $VERSION (NeoPerl::MCP::Registry $NeoPerl::MCP::Registry::VERSION)\n";
+    exit 0;
+}
+
+my $HAS_MOJO_JSON = eval { require Mojo::JSON; 1 } ? 1 : 0;
+sub _enc_json {
+    return $HAS_MOJO_JSON
+        ? Mojo::JSON::encode_json($_[0])
+        : JSON::PP->new->utf8->encode($_[0]);
+}
+sub _dec_json {
+    return $HAS_MOJO_JSON
+        ? Mojo::JSON::decode_json($_[0])
+        : JSON::PP->new->utf8->decode($_[0]);
+}
+
+my $reg = NeoPerl::MCP::Registry->new(
+    read_only => ($allow_write ? 0 : 1),
+    (defined $dsn  ? (dsn  => $dsn)  : ()),
+    (defined $user ? (user => $user) : ()),
+    (defined $pass ? (pass => $pass) : ()),
+);
+
+if ($list_packs) {
+    my $packs = $reg->list_packs();
+    if ($as_json) {
+        print JSON::PP->new->utf8->canonical(1)->pretty(1)->encode($packs);
+    }
+    else {
+        printf "%-11s %-12s %5s  %s\n", 'PACK', 'CATEGORY', 'TOOLS', 'DESCRIPTION';
+        printf "%-11s %-12s %5s  %s\n", ('-' x 11), ('-' x 12), ('-' x 5), ('-' x 44);
+        for my $p (@$packs) {
+            printf "%-11s %-12s %5d  %s\n",
+                $p->{name}, $p->{category}, $p->{tool_count}, $p->{label};
+        }
+    }
+    exit 0;
+}
+
+my @requested = map { grep { length } split /,/, $_ } @pack_args;
+
+if ($emit_config) {
+    my $res = $reg->emit_mcp_config(
+        (@requested ? (packs => \@requested) : (include_all => 1)),
+        (defined $output_path ? (path => $output_path) : ()),
+    );
+    if (defined $output_path) {
+        print "Wrote $res->{server_count} MCP server entries to $output_path\n";
+    }
+    else {
+        print $res->{json};
+    }
+    exit 0;
+}
+
+@requested = ('all') unless @requested;
+
+if (!$use_stdio && !defined $http_addr) {
+    die "Specify one of --list-packs, --emit-mcp-config, --stdio, or --http=127.0.0.1:<port>.\n";
+}
+
+my ($host, $port) = ('127.0.0.1', 0);
+if (defined $http_addr) {
+    if ($http_addr =~ /\A(?:https?:\/\/)?([^:\/]+):(\d+)\z/i) {
+        ($host, $port) = ($1, int($2));
+    }
+    elsif ($http_addr =~ /\A(\d+)\z/) {
+        $port = int($1);
+    }
+    else {
+        die "Invalid --http value '$http_addr' (expected host:port or port)\n";
+    }
+}
+
+my $mcp = NeoPerl::Antigravity::EditorMCP->new(
+    no_builtins    => 1,
+    server_name    => 'npl-mcp',
+    host           => $host,
+    port           => $port,
+    force_fallback => $fallback_http ? 1 : 0,
+);
+$reg->set_editor_mcp($mcp);
+
+my $en = $reg->enable_pack(\@requested);
+if (!$en->{ok}) {
+    die "Failed to enable MCP pack(s): " . ($en->{error} || 'unknown error') . "\n";
+}
+
+if (defined $http_addr) {
+    my $bound = $mcp->start();
+    STDOUT->autoflush(1);
+    printf "npl-mcp listening on http://%s:%d/mcp (engine=%s, packs=%s, tools=%d)\n",
+        $host, $bound, $mcp->engine, join(',', @{ $reg->active_packs() }),
+        scalar(@{ $mcp->list_tool_names() });
+    $mcp->run_forever();
+    exit 0;
+}
+
+# --- Stdio NDJSON (with transparent Content-Length fallback) ---
+binmode(STDIN);
+binmode(STDOUT);
+STDOUT->autoflush(1);
+
+while (defined(my $line = <STDIN>)) {
+    my $raw_json;
+    my $framed = 0;
+
+    if ($line =~ /\AContent-Length:\s*(\d+)\r?\n\z/i) {
+        my $clen = int($1);
+        $framed = 1;
+        while (defined(my $hdr = <STDIN>)) {
+            last if $hdr =~ /\A\r?\n\z/;
+        }
+        my $buf = '';
+        my $need = $clen;
+        while ($need > 0) {
+            my $chunk = '';
+            my $n = read(STDIN, $chunk, $need);
+            last unless defined $n && $n > 0;
+            $buf .= $chunk;
+            $need -= $n;
+        }
+        $raw_json = $buf;
+    }
+    else {
+        $line =~ s/\A\s+|\s+\z//g;
+        next unless length $line;
+        $raw_json = $line;
+    }
+
+    my $req = eval { _dec_json($raw_json) };
+    my $resp;
+    if (!$req || ref($req) ne 'HASH') {
+        $resp = {
+            jsonrpc => '2.0',
+            id      => undef,
+            error   => { code => -32700, message => 'Parse error' },
+        };
+    }
+    else {
+        $resp = $mcp->handle_jsonrpc($req);
+    }
+
+    next unless defined $resp;
+    my $out = _enc_json($resp);
+    if ($framed) {
+        print STDOUT "Content-Length: " . length($out) . "\r\n\r\n" . $out;
+    }
+    else {
+        print STDOUT "$out\n";
+    }
+    STDOUT->flush();
+}
+
+exit 0;
+
+__END__
+
+=head1 NAME
+
+npl-mcp - Standalone NeoPerl::MT MCP domain pack server (stdio and Mojolicious HTTP)
+
+=head1 SYNOPSIS
+
+    npl-mcp --list-packs
+    npl-mcp --pack=db2z,cobol --stdio
+    npl-mcp --pack=all --http=127.0.0.1:8810
+    npl-mcp --emit-mcp-config > .agents/mcp_config.json
+
+=head1 DESCRIPTION
+
+Runs one or more of the twelve C<NeoPerl::MCP::Pack::*> domain packs as a
+standalone Model Context Protocol (MCP) JSON-RPC 2.0 server over NDJSON stdio
+or Streamable HTTP (powered by C<mojolicious-mt> with an L<IO::Socket::INET>
+fallback).
+
+=head1 AUTHOR
+
+stratum42
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself (Artistic License 2.0 or GNU GPL).
+
+=cut

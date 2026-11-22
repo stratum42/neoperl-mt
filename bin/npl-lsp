@@ -1,0 +1,137 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use FindBin ();
+use File::Spec ();
+use Cwd qw(abs_path);
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my $ROOT;
+
+BEGIN {
+    $ROOT = abs_path(File::Spec->catdir($FindBin::RealBin, File::Spec->updir));
+    for my $rel (
+        File::Spec->catdir('blib', 'arch'),
+        File::Spec->catdir('blib', 'lib'),
+        'lib',
+    ) {
+        my $dir = File::Spec->catdir($ROOT, $rel);
+        unshift @INC, $dir if -d $dir;
+    }
+
+    # Add optional sibling MT repositories and $HOME/perl5 to @INC when present
+    my $parent = File::Spec->catdir($ROOT, File::Spec->updir);
+    my %have = map { $_ => 1 } grep { !ref($_) } @INC;
+    my $prepend = sub {
+        my ($d) = @_;
+        return unless defined $d && -d $d;
+        my $abs = eval { abs_path($d) } || $d;
+        return if $have{$abs};
+        unshift @INC, $abs;
+        $have{$abs} = 1;
+    };
+
+    my $home = $ENV{HOME} || $ENV{USERPROFILE} || '';
+    $prepend->(File::Spec->catdir($home, 'perl5', 'lib', 'perl5')) if length $home;
+
+    for my $spec (
+        [ $ENV{NEOPERL_DBD_SQLITE_DIR}, 'dbd-sqlite-mt',  [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBD_ODBC_DIR},   'dbd-odbc-mt',    [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_DBI_DIR},        'dbi-mt',         [ 'blib/arch', 'blib/lib', 'lib' ] ],
+        [ $ENV{NEOPERL_MOJO_DIR},       'mojolicious-mt', [ 'xs/blib/arch', 'xs/blib/lib', 'lib' ] ],
+    ) {
+        my ($env_dir, $repo, $subs) = @$spec;
+        my $base = (defined $env_dir && length $env_dir && -d $env_dir)
+            ? $env_dir
+            : File::Spec->catdir($parent, $repo);
+        next unless -d $base;
+        for my $rel (reverse @$subs) {
+            $prepend->(File::Spec->catdir($base, split('/', $rel)));
+        }
+    }
+}
+
+use NeoPerl::LSP::Builtin;
+use NeoPerl::LSP::Engine;
+
+our $VERSION = '0.01';
+
+my $lang         = 'all';
+my $list_langs   = 0;
+my $show_help    = 0;
+my $show_version = 0;
+
+GetOptions(
+    'lang=s'     => \$lang,
+    'list-langs' => \$list_langs,
+    'version|V'  => \$show_version,
+    'help|h'     => \$show_help,
+) or die "Run 'npl-lsp --help' for usage.\n";
+
+if ($show_help) {
+    print <<'USAGE';
+Usage: npl-lsp [--lang=<domain>]
+
+Standalone NeoPerl::MT LSP 3.17 server over Content-Length framed stdio.
+
+Options:
+  --lang=<domain>   Language domain: sql|db2i|db2luw|db2z|informix|hlasm|asm|
+                    rpgile|cobol|sycl|hip|glsl|metal|all (default: all)
+  --list-langs      Print supported language domains and exit
+  -V, --version     Show version and exit
+  -h, --help        Show this help message
+USAGE
+    exit 0;
+}
+
+if ($show_version) {
+    print "npl-lsp $VERSION (NeoPerl::LSP::Engine $NeoPerl::LSP::Engine::VERSION)\n";
+    exit 0;
+}
+
+if ($list_langs) {
+    print join("\n", @{ NeoPerl::LSP::Builtin->supported_langs() }), "\n";
+    exit 0;
+}
+
+my $norm_lang = NeoPerl::LSP::Builtin->normalize_lang($lang);
+my $provider  = NeoPerl::LSP::Builtin->new(lang => $norm_lang);
+my $engine    = NeoPerl::LSP::Engine->new(
+    provider    => $provider,
+    lang        => $norm_lang,
+    server_name => "npl-lsp-$norm_lang",
+);
+
+exit $engine->run();
+
+__END__
+
+=head1 NAME
+
+npl-lsp - Standalone NeoPerl::MT multi-domain Language Server Protocol (LSP 3.17) server
+
+=head1 SYNOPSIS
+
+    npl-lsp --lang=hlasm
+    npl-lsp --lang=cobol
+    npl-lsp --lang=all
+
+=head1 DESCRIPTION
+
+Speaks Language Server Protocol 3.17 JSON-RPC 2.0 over C<Content-Length> framed
+stdio, delivering diagnostics, hover documentation, completions, document symbols,
+and go-to-definition across SQL/Db2/Informix, HLASM, Multi-ISA Assembly,
+RPGILE, COBOL, Intel SYCL/OpenCL, AMD HIP/ROCm, Vulkan GLSL/SPIR-V, and Apple
+Metal MSL.
+
+=head1 AUTHOR
+
+stratum42
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself (Artistic License 2.0 or GNU GPL).
+
+=cut
